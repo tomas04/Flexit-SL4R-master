@@ -52,12 +52,13 @@ SoftwareSerial serialPort(RXen, TXen);
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
 
-void reconnect(void);
+void reconnect();
 void callback(char*, byte*, unsigned int);
 void createCommand(uint8_t, uint8_t);
-void sendCommand(void);
-void processFlexitData(void);
+void sendCommand();
+void processFlexitData();
 void updateFlexitData();
+void updateMQTTServer();
 
 void setup() {
   serialPort.begin(19200); 
@@ -87,49 +88,41 @@ void loop() {
   client.loop();
   
   updateFlexitData();
-
+  updateMQTTServer();
   //if received CS50 controller data is different than what has been sent to MQTT server, publish the data to the MQTT server
-  if (fanLevel != sentFanLevel)
-  {
-    client.publish(OutTopicFanLevel, fanLevel, 1);
-    sentFanLevel = fanLevel;
-  }
-  if (heatExchTemp != sentHeatExchTemp)
-  {
-    client.publish(OutTopicHeatExchTemp, heatExchTemp, 1);
-    sentHeatExchTemp = heatExchTemp;
-  }
-  if (preheatOnOff != sentPreheatOnOff)
-  {
-    client.publish(OutTopicPreheatOnOff, preheatOnOff, 1);
-    sentPreheatOnOff = preheatOnOff;
-  }
-  if (preheatActive != sentPreheatActive)
-  {
-    client.publish(OutTopicPreheatActive, preheatActive, 1);
-    sentPreheatActive = preheatActive;
-  }
+  
   
   //MUST delay to allow ESP8266 WIFI functions to run
   delay(10);
+}
+
+void updateMQTTServer() {
+  if (fanLevel != sentFanLevel)
+    if(client.publish(OutTopicFanLevel, fanLevel, 1))
+      sentFanLevel = fanLevel;
+  if (heatExchTemp != sentHeatExchTemp)
+    if(client.publish(OutTopicHeatExchTemp, heatExchTemp, 1))
+      sentHeatExchTemp = heatExchTemp;
+  if (preheatOnOff != sentPreheatOnOff)
+    if(client.publish(OutTopicPreheatOnOff, preheatOnOff, 1))
+      sentPreheatOnOff = preheatOnOff;
+  if (preheatActive != sentPreheatActive)
+    if(client.publish(OutTopicPreheatActive, preheatActive, 1))
+      sentPreheatActive = preheatActive;
 }
 
 void reconnect() {
 
   //attempt to connect to the wifi if connection is lost
   if(WiFi.status() != WL_CONNECTED)
-  {
     //loop while we wait for connection
     while (WiFi.status() != WL_CONNECTED) 
-    {
       delay(500);
-    }
-  }
 
   //make sure we are connected to WIFI before attemping to reconnect to MQTT
-  if(WiFi.status() == WL_CONNECTED) {
+  if(WiFi.status() == WL_CONNECTED)
   // Loop until we're reconnected to the MQTT server
-    while (!client.connected()) {
+    while (!client.connected())
       // Generate client name based on MAC address and last 8 bits of microsecond counter
       //if connected, subscribe to the topic(s) we want to be notified about
       if (client.connect(ClientName)) {
@@ -137,8 +130,6 @@ void reconnect() {
         client.subscribe(InTopicFanLevel);
         client.subscribe(InTopicHeatExchTemp);
       }
-    }
-  }
 }
           
 /*/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
