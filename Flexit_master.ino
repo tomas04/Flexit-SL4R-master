@@ -1,11 +1,14 @@
 /*
-* Flexit master for SL4R ventilation system (CS50 cntrol board)
-* Tested on Arduino Mega. 
-* Important! increase SERIAL_RX_BUFFER in HardwareSerial.h 
+* Untested fork of https://github.com/Vongraven/Flexit-SL4R-master
+* Sending data over MQTT using ESP8266 and MAX3485. Waiting for parts..
 */
 
-#define RXen    4
-#define TXen    5
+#include <PubSubClient.h>
+#include <ESP8266WiFi.h>
+#include <SoftwareSerial.h>
+
+#define RXen    2
+#define TXen    3
 #define COM_VCC 6
 
 #define rawFanLevel         rawData[5]
@@ -19,15 +22,46 @@
 #define preheatOnOff        processedData[2]
 #define preheatActive       processedData[3]
 
+#define SentFanLevel        latestSentData[0]
+#define SentHeatExchTemp    latestSentData[1]
+#define SentPreheatOnOff    latestSentData[2]
+#define SentPreheatActive   latestSentData[3]
 
+char* mqtt_server = "YOUR_MQTT_SERVER_ADDRESS";
+char* ssid = "YOUR_SSID";
+char* password = "YOUR_PASSWORD";
+
+char* ClientName = "CS50-Slave";
+
+char* InTopicPreheatOnOff = "/CS50-Command/heat";
+char* InTopicFanLevel = "/CS50-Command/fan_level";
+char* InTopicHeatExchTemp = "/CS50-Command/temperature";
+
+char* OutTopicPreheatOnOff = "/CS50-Response/heat";
+char* OutTopicFanLevel = "/CS50-Response/fan_level";
+char* OutTopicHeatExchTemp = "/CS50-Response/temperature";
+char* OutTopicPreheatActive = "/CS50-Response/heater_active";
+
+uint8_t commandBuffer[18] = {195, 4, 0, 199, 81, 193, 4, 8, 32, 15, 0, 'F', 'P', 4, 0, 'T' };
+uint8_t processedData [4]   = {};
+uint8_t latestSentData [4]   = {};
+uint8_t rawData [25]   = {};
+
+SoftwareSerial serialPort(RXen, TXen);
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
 // Eavsdrop command sent from CI50 controller and match values in commandBuffer[] 
-uint8_t commandBuffer[18] = {195, 4, 0, 199, 81, 193, 4, 8, 32, 15, 0, 'F', 'P', 4, 0, 'T' };    
-uint8_t processedData [4]   = {}; 
-uint8_t rawData [25]   = {};                           
 
-
-void setup() {          
-  Serial1.begin(19200, SERIAL_8N1); 
+void setup() {
+  serialPort.begin(19200); 
+  //start wifi subsystem
+  WiFi.begin(ssid, password);
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  //attempt to connect to the WIFI network and then connect to the MQTT server
+  reconnect();
+  //wait a bit before continuing
+  delay(2000);
 
   pinMode(RXen, OUTPUT);
   pinMode(TXen, OUTPUT);
@@ -36,39 +70,127 @@ void setup() {
   digitalWrite(RXen, LOW);
   digitalWrite(TXen, LOW);
   digitalWrite(COM_VCC, LOW);
- 
 }
 
 
-void loop() {       
+void loop() {
+  //reconnect if connection is lost
+  if (!client.connected() && WiFi.status() == 3) {reconnect();}
+
+  //maintain MQTT connection
+  client.loop();
+  
+  updateFlexitData();
+
+  //if received CS50 controller data is different than what has been sent to MQTT server, publish the data to the MQTT server
+  if (fanLevel != SentFanLevel)
+  {
+    client.publish(OutTopicFanLevel, (char*)fanLevel);
+    SentFanLevel=fanLevel;
+  }
+  if (heatExchTemp != SentHeatExchTemp)
+  {
+    client.publish(OutTopicHeatExchTemp, (char*)heatExchTemp);
+    SentHeatExchTemp=heatExchTemp;
+  }
+  if (preheatOnOff != SentPreheatOnOff)
+  {
+    client.publish(OutTopicPreheatOnOff, (char*)preheatOnOff);
+    SentPreheatOnOff=preheatOnOff;
+  }
+  if (preheatActive != SentPreheatActive)
+  {
+    client.publish(OutTopicPreheatActive, (char*)preheatActive);
+    SentPreheatActive=preheatActive;
+  }
+  
+  //MUST delay to allow ESP8266 WIFI functions to run
+  delay(10);
 }
 
+void callback(char* topic, byte* payload, unsigned int length) {
+  if(topic==InTopicPreheatOnOff)
+  {
+    if (payload[0]==0)
+      createCommand(15,0);
+    else if (payload[0]==1)
+      createCommand(15,128);
+    else
+      //should this be placed another place? Is callback paused while running callback?
+      client.print("heat_cmd_unknown");
+  }
+  else if(topic==InTopicFanLevel)
+  {
+    if (payload[0]>=0 && (char)payload[0]<=3)
+      createCommand(11,payload[0]);
+    else
+      client.print("fan_cmd_unknown");
+  }
+  else if(topic==InTopicHeatExchTemp)
+  {
+      if (payload[0]>=15 && (char)payload[0]<=25)
+        createCommand(15,payload[0]);
+      else
+        client.print("tmp_cmd_unknown");
+  } else {
+    client.print("topic " + topic + " unknown");
+  }
+  //then back to loop, wait for command confirmation from updateFlexitData()
+}
+
+void reconnect() {
+
+  //attempt to connect to the wifi if connection is lost
+  if(WiFi.status() != WL_CONNECTED)
+  {
+    //loop while we wait for connection
+    while (WiFi.status() != WL_CONNECTED) 
+    {
+      delay(500);
+    }
+  }
+
+  //make sure we are connected to WIFI before attemping to reconnect to MQTT
+  if(WiFi.status() == WL_CONNECTED) {
+  // Loop until we're reconnected to the MQTT server
+    while (!client.connected()) {
+      // Generate client name based on MAC address and last 8 bits of microsecond counter
+      //if connected, subscribe to the topic(s) we want to be notified about
+      if (client.connect(ClientName) {
+        client.subscribe(InTopicHeater);
+        client.subscribe(InTopicFanLevel);
+        client.subscribe(InTopicHeatExchTemp);
+      }
+    }
+  }
+}
+          
 /*/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 * CS50 control board repeats 16 lines of data over and over. For this purpose only line number 15 is needed. 
 * Look for a specific combination of bytes to identify the correct line.
 * When combination is matched, read the line into buffer rawData[]
 *//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void updateFlexitData() {
-  digitalWrite(COM_VCC, HIGH);      // activate MAX485 
-  digitalWrite(RXen, LOW);      // RX enable
+  digitalWrite(COM_VCC, HIGH); // activate MAX485 
+  digitalWrite(RXen, LOW);     // RX enable
   uint8_t Buffer[1000];
   
   for (int i=0; i<1000; ++i) {
-    while (!Serial1.available()); 
-    Buffer[i] = Serial1.read();
+    while (!serialPort.available()); 
+    Buffer[i] = serialPort.read();
     if (Buffer[i]==22 && Buffer[i-2]==193 && Buffer[i-8]==195) {
       for (int i=0; i<25; ++i) {
-        while (!Serial1.available()); 
-        rawData[i] = Serial1.read();
+        while (!serialPort.available()); 
+        rawData[i] = serialPort.read();
       }
     break;
     }
-    if (i == 999) Serial.println("StBuffer not updated"); 
+    //if (i == 999) serialPort.println("StBuffer not updated"); 
   }
 
-  digitalWrite(RXen, HIGH);     // RX disable
-  digitalWrite(COM_VCC, LOW);     // deactivate MAX485      
-  while (Serial1.available()) Serial1.read();     // empty serial RX buffer
+  digitalWrite(RXen, HIGH);   // RX disable
+  digitalWrite(COM_VCC, LOW); // deactivate MAX485      
+  while (serialPort.available()) serialPort.read();     // empty serialPort RX buffer
 }  
 
 /*/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////  
@@ -148,30 +270,30 @@ void sendCommand () {
   uint8_t data;  
   int Length, repeats=0;
   do {
-    while (!Serial1.available());
-    data=Serial1.read();
+    while (!serialPort.available());
+    data=serialPort.read();
     if (data == 195){
-      while (!Serial1.available());
-      data=Serial1.read();
+      while (!serialPort.available());
+      data=serialPort.read();
       if (data == 1){
         for (int i=0; i<6; ++i) {
-          while (!Serial1.available());
-          Serial1.read();
+          while (!serialPort.available());
+          serialPort.read();
         }
     
-        while (!Serial1.available());    
-        Length = Serial1.read()+2;
+        while (!serialPort.available());    
+        Length = serialPort.read()+2;
         if (3 < Length <33) {
           for (int i=0; i<Length; ++i) {
-            while (!Serial1.available());
-            Serial1.read();
+            while (!serialPort.available());
+            serialPort.read();
           }
           digitalWrite(TXen, LOW);      // TX enable
           delay(10);
-          Serial1.write(commandBuffer, 18);     // transmit command
-          Serial1.flush();
+          serialPort.write(commandBuffer, 18);     // transmit command
+          serialPort.flush();
           digitalWrite(TXen, HIGH);     // TX disable
-          Serial.println("command sent");
+          serialPort.println("command sent");
           ++repeats;
         }
       }
