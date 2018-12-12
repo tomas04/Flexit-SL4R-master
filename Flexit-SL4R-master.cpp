@@ -3,6 +3,7 @@
 * Sending data over MQTT using ESP8266 and MAX3485. Waiting for parts..
 */
 
+#include <Arduino.h>
 #include <PubSubClient.h>
 #include <ESP8266WiFi.h>
 #include <SoftwareSerial.h>
@@ -11,46 +12,52 @@
 #define TXen    3
 #define COM_VCC 6
 
-#define rawFanLevel         rawData[5]
-#define rawPreheatOnOff     rawData[6]
-#define rawHeatExchTemp     rawData[9]
-#define rawPreheatActive1   rawData[10]
-#define rawPreheatActive2   rawData[11]
+const char* mqtt_server = "YOUR_MQTT_SERVER_ADDRESS";
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
 
-#define fanLevel            processedData[0]
-#define heatExchTemp        processedData[1]
-#define preheatOnOff        processedData[2]
-#define preheatActive       processedData[3]
+const char* ClientName = "CS50-Slave";
 
-#define SentFanLevel        latestSentData[0]
-#define SentHeatExchTemp    latestSentData[1]
-#define SentPreheatOnOff    latestSentData[2]
-#define SentPreheatActive   latestSentData[3]
+const char* InTopicPreheatOnOff = "/CS50-Command/heat";
+const char* InTopicFanLevel = "/CS50-Command/fan_level";
+const char* InTopicHeatExchTemp = "/CS50-Command/temperature";
 
-char* mqtt_server = "YOUR_MQTT_SERVER_ADDRESS";
-char* ssid = "YOUR_SSID";
-char* password = "YOUR_PASSWORD";
-
-char* ClientName = "CS50-Slave";
-
-char* InTopicPreheatOnOff = "/CS50-Command/heat";
-char* InTopicFanLevel = "/CS50-Command/fan_level";
-char* InTopicHeatExchTemp = "/CS50-Command/temperature";
-
-char* OutTopicPreheatOnOff = "/CS50-Response/heat";
-char* OutTopicFanLevel = "/CS50-Response/fan_level";
-char* OutTopicHeatExchTemp = "/CS50-Response/temperature";
-char* OutTopicPreheatActive = "/CS50-Response/heater_active";
+const char* OutTopicPreheatOnOff = "/CS50-Response/heat";
+const char* OutTopicFanLevel = "/CS50-Response/fan_level";
+const char* OutTopicHeatExchTemp = "/CS50-Response/temperature";
+const char* OutTopicPreheatActive = "/CS50-Response/heater_active";
 
 uint8_t commandBuffer[18] = {195, 4, 0, 199, 81, 193, 4, 8, 32, 15, 0, 'F', 'P', 4, 0, 'T' };
 uint8_t processedData [4]   = {};
 uint8_t latestSentData [4]   = {};
 uint8_t rawData [25]   = {};
 
+uint8_t* rawFanLevel       = &rawData[5];
+uint8_t* rawPreheatOnOff   = &rawData[6];
+uint8_t* rawHeatExchTemp   = &rawData[9];
+uint8_t* rawPreheatActive1 = &rawData[10];
+uint8_t* rawPreheatActive2 = &rawData[11];
+
+uint8_t* fanLevel          = &processedData[0];
+uint8_t* heatExchTemp      = &processedData[1];
+uint8_t* preheatOnOff      = &processedData[2];
+uint8_t* preheatActive     = &processedData[3];
+
+uint8_t* sentFanLevel      = &latestSentData[0];
+uint8_t* sentHeatExchTemp  = &latestSentData[1];
+uint8_t* sentPreheatOnOff  = &latestSentData[2];
+uint8_t* sentPreheatActive = &latestSentData[3];
+
 SoftwareSerial serialPort(RXen, TXen);
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
-// Eavsdrop command sent from CI50 controller and match values in commandBuffer[] 
+
+void reconnect(void);
+void callback(char*, byte*, unsigned int);
+void createCommand(uint8_t, uint8_t);
+void sendCommand(void);
+void processFlexitData(void);
+void updateFlexitData();
 
 void setup() {
   serialPort.begin(19200); 
@@ -72,7 +79,6 @@ void setup() {
   digitalWrite(COM_VCC, LOW);
 }
 
-
 void loop() {
   //reconnect if connection is lost
   if (!client.connected() && WiFi.status() == 3) {reconnect();}
@@ -83,59 +89,29 @@ void loop() {
   updateFlexitData();
 
   //if received CS50 controller data is different than what has been sent to MQTT server, publish the data to the MQTT server
-  if (fanLevel != SentFanLevel)
+  if (fanLevel != sentFanLevel)
   {
-    client.publish(OutTopicFanLevel, (char*)fanLevel);
-    SentFanLevel=fanLevel;
+    client.publish(OutTopicFanLevel, fanLevel, 1);
+    sentFanLevel = fanLevel;
   }
-  if (heatExchTemp != SentHeatExchTemp)
+  if (heatExchTemp != sentHeatExchTemp)
   {
-    client.publish(OutTopicHeatExchTemp, (char*)heatExchTemp);
-    SentHeatExchTemp=heatExchTemp;
+    client.publish(OutTopicHeatExchTemp, heatExchTemp, 1);
+    sentHeatExchTemp = heatExchTemp;
   }
-  if (preheatOnOff != SentPreheatOnOff)
+  if (preheatOnOff != sentPreheatOnOff)
   {
-    client.publish(OutTopicPreheatOnOff, (char*)preheatOnOff);
-    SentPreheatOnOff=preheatOnOff;
+    client.publish(OutTopicPreheatOnOff, preheatOnOff, 1);
+    sentPreheatOnOff = preheatOnOff;
   }
-  if (preheatActive != SentPreheatActive)
+  if (preheatActive != sentPreheatActive)
   {
-    client.publish(OutTopicPreheatActive, (char*)preheatActive);
-    SentPreheatActive=preheatActive;
+    client.publish(OutTopicPreheatActive, preheatActive, 1);
+    sentPreheatActive = preheatActive;
   }
   
   //MUST delay to allow ESP8266 WIFI functions to run
   delay(10);
-}
-
-void callback(char* topic, byte* payload, unsigned int length) {
-  if(topic==InTopicPreheatOnOff)
-  {
-    if (payload[0]==0)
-      createCommand(15,0);
-    else if (payload[0]==1)
-      createCommand(15,128);
-    else
-      //should this be placed another place? Is callback paused while running callback?
-      client.print("heat_cmd_unknown");
-  }
-  else if(topic==InTopicFanLevel)
-  {
-    if (payload[0]>=0 && (char)payload[0]<=3)
-      createCommand(11,payload[0]);
-    else
-      client.print("fan_cmd_unknown");
-  }
-  else if(topic==InTopicHeatExchTemp)
-  {
-      if (payload[0]>=15 && (char)payload[0]<=25)
-        createCommand(15,payload[0]);
-      else
-        client.print("tmp_cmd_unknown");
-  } else {
-    client.print("topic " + topic + " unknown");
-  }
-  //then back to loop, wait for command confirmation from updateFlexitData()
 }
 
 void reconnect() {
@@ -156,8 +132,8 @@ void reconnect() {
     while (!client.connected()) {
       // Generate client name based on MAC address and last 8 bits of microsecond counter
       //if connected, subscribe to the topic(s) we want to be notified about
-      if (client.connect(ClientName) {
-        client.subscribe(InTopicHeater);
+      if (client.connect(ClientName)) {
+        client.subscribe(InTopicPreheatOnOff);
         client.subscribe(InTopicFanLevel);
         client.subscribe(InTopicHeatExchTemp);
       }
@@ -199,31 +175,33 @@ void updateFlexitData() {
 * - Heat exchanger temperature is unchanged (15 - 25 degrees) 
 *//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void processFlexitData(){
-  if (rawFanLevel == 17 ||rawFanLevel == 34 ||rawFanLevel == 51) {
-    fanLevel = rawFanLevel / 17;
-    commandBuffer[11] = rawFanLevel;      
+  if (*rawFanLevel == 17 ||*rawFanLevel == 34 ||*rawFanLevel == 51) {
+    *fanLevel = *rawFanLevel / 17;
+    commandBuffer[11] = *rawFanLevel;      
   }
       
-  if (rawPreheatOnOff == 128) {
-    preheatOnOff = 1;
+  if (*rawPreheatOnOff == 128) {
+    *preheatOnOff = 1;
     commandBuffer[12] = 128;  
   }
-  else if (rawPreheatOnOff == 0) {
-    preheatOnOff = commandBuffer[12] = preheatActive = 0; 
+  else if (*rawPreheatOnOff == 0) {
+    *preheatOnOff = commandBuffer[12] = *preheatActive = 0; 
   }
       
-  if (14< rawHeatExchTemp <26) {
-    heatExchTemp = commandBuffer[15] = rawHeatExchTemp;  
+  if (*rawHeatExchTemp >= 15 && *rawHeatExchTemp <= 25) {
+    *heatExchTemp = commandBuffer[15] = *rawHeatExchTemp;  
   }
 
-  if (rawPreheatActive1 >10 && preheatActive == 0 && preheatOnOff == 1) { 
-    preheatActive = 1;
+  if (*rawPreheatActive1 > 10 && *preheatActive == 0 && *preheatOnOff == 1) { 
+    *preheatActive = 1;
   }
       
-  if (rawPreheatActive2 <100 && preheatActive == 1 && preheatOnOff == 1) {
-    preheatActive = 0;
+  if (*rawPreheatActive2 < 100 && *preheatActive == 1 && *preheatOnOff == 1) {
+    *preheatActive = 0;
   }
 }
+
+
 
 /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 * createCommand() takes two arguments, command and level
@@ -250,7 +228,7 @@ void processFlexitData(){
 void createCommand(uint8_t cmd, uint8_t lvl) {                                    
   commandBuffer[cmd] = lvl;
   int sum1=0, sum2=0;
-  for ( int i=5; i<(sizeof(commandBuffer)-2) ; ++i) {
+  for ( int i=5; i<((uint8_t)sizeof(commandBuffer)-2) ; ++i) {
     sum1 = sum1 + commandBuffer[i];
     sum2 = (sum2 + sum1);
   }
@@ -260,8 +238,38 @@ void createCommand(uint8_t cmd, uint8_t lvl) {
   sendCommand();
 }
 
+void callback(char* topic, byte* payload, unsigned int length) {
+  if(topic==InTopicPreheatOnOff)
+  {
+    if (payload[0]==0)
+      createCommand(15,0);
+    else if (payload[0]==1)
+      createCommand(15,128);
+    else
+      //should this be placed another place? Is callback paused while running callback?
+      client.print("heat_cmd_unknown");
+  }
+  else if(topic==InTopicFanLevel)
+  {
+    if (payload[0]>=0 && (char)payload[0]<=3)
+      createCommand(11,payload[0]);
+    else
+      client.print("fan_cmd_unknown");
+  }
+  else if(topic==InTopicHeatExchTemp)
+  {
+      if (payload[0]>=15 && (char)payload[0]<=25)
+        createCommand(15,payload[0]);
+      else
+        client.print("tmp_cmd_unknown");
+  } else {
+    //client.print("topic " + topic + " unknown");
+  }
+  //then back to loop, wait for command confirmation from updateFlexitData()
+}
+
 /*/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-* Transmission of the commands must be timed so they dont collide with data from the CS60 control board. 
+* Transmission of the commands must be timed so they dont collide with data from the CS50 control board. 
 * Find the length of the incomming line (value number 8 in each line), count the bytes until end of line is reached, jump in and send command   
 */////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////  
 void sendCommand () {  
@@ -283,7 +291,7 @@ void sendCommand () {
     
         while (!serialPort.available());    
         Length = serialPort.read()+2;
-        if (3 < Length <33) {
+        if (Length > 3 && Length < 33) {
           for (int i=0; i<Length; ++i) {
             while (!serialPort.available());
             serialPort.read();
@@ -302,5 +310,3 @@ void sendCommand () {
   digitalWrite(RXen, HIGH);     // RX disable
   digitalWrite(COM_VCC, LOW);     // deactivate MAX485  
 }
-
-
