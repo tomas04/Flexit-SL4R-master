@@ -4,28 +4,42 @@
 */
 
 #include <Arduino.h>
-#include <PubSubClient.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <PubSubClient.h>
 #include <SoftwareSerial.h>
+#include "Timer.h"
 
-#define RXen    2
-#define TXen    3
-#define COM_VCC 6
+#define RX D3
+#define TX D4
+#define RXen D5
+#define TXen D6
 
-const char* mqtt_server = "YOUR_MQTT_SERVER_ADDRESS";
-const char* ssid = "YOUR_SSID";
-const char* password = "YOUR_PASSWORD";
+#define WIFI_SSID "wireless_network_name"
+#define WIFI_PASS "wireless_network_psw"
+#define MQTT_HOST "mqtt_server_ip_address"
+#define MQTT_PORT 1883
+#define MQTT_USER "mqtt_user"
+#define MQTT_PASS "mqtt_password"
 
-const char* ClientName = "CS50-Slave";
+#define TOPSZ 60  // Max number of characters in topic string
+#define MESSZ 240 // Max number of characters in JSON message string
 
-const char* InTopicPreheatOnOff = "/CS50-Command/heat";
-const char* InTopicFanLevel = "/CS50-Command/fan_level";
-const char* InTopicHeatExchTemp = "/CS50-Command/temperature";
+#define MQTT_CLIENT_ID "FlexitPanel"
 
-const char* OutTopicPreheatOnOff = "/CS50-Response/heat";
-const char* OutTopicFanLevel = "/CS50-Response/fan_level";
-const char* OutTopicHeatExchTemp = "/CS50-Response/temperature";
-const char* OutTopicPreheatActive = "/CS50-Response/heater_active";
+//MQTT command:
+#define MQTT_COMMAND_CHANNEL "command/FlexitPanel/#"
+//MQTT status: 
+//heater element enabled or disabled
+#define MQTT_STATUS_HEATER_ENABLE "state/FlexitPanel/heater_enable"
+//fan level, 1 (low), 2 (medium), 3 (high)
+#define MQTT_STATUS_FAN "state/FlexitPanel/fan_level"
+//temperature
+#define MQTT_STATUS_TEMP "state/FlexitPanel/temperature"
+//heater state, (is the heating element active)
+#define MQTT_STATUS_HEATER_STATE "state/FlexitPanel/heater_state"
 
 uint8_t commandBuffer[18] = {195, 4, 0, 199, 81, 193, 4, 8, 32, 15, 0, 'F', 'P', 4, 0, 'T' };
 uint8_t processedData [4]   = {};
@@ -40,96 +54,220 @@ uint8_t* rawPreheatActive2 = &rawData[11];
 
 uint8_t* fanLevel          = &processedData[0];
 uint8_t* heatExchTemp      = &processedData[1];
-uint8_t* preheatOnOff      = &processedData[2];
-uint8_t* preheatActive     = &processedData[3];
+uint8_t* preheatEnable      = &processedData[2];
+uint8_t* preheatState     = &processedData[3];
 
 uint8_t* sentFanLevel      = &latestSentData[0];
 uint8_t* sentHeatExchTemp  = &latestSentData[1];
-uint8_t* sentPreheatOnOff  = &latestSentData[2];
-uint8_t* sentPreheatActive = &latestSentData[3];
+uint8_t* sentPreheatEnable  = &latestSentData[2];
+uint8_t* sentPreheatState = &latestSentData[3];
 
-SoftwareSerial serialPort(RXen, TXen);
-WiFiClient wifiClient;
-PubSubClient client(wifiClient);
+//Serial Serial1(2, 3);
+WiFiClient espClient;               // Wifi Client
+PubSubClient mqttClient(espClient);   // MQTT Client
+SoftwareSerial softSer(RX, TX);
+Timer t;
 
+void initWIFI();
+void initMQTT();
+void initOTA();
+void reconnectMQTT();
+void mqttDataCb(char* topic, byte* data, unsigned int data_le);
+void publishState();
 void reconnect();
 void callback(char*, byte*, unsigned int);
 void createCommand(uint8_t, uint8_t);
 void sendCommand();
 void processFlexitData();
 void updateFlexitData();
-void updateMQTTServer();
+void updateMQTTServer(bool);
+void oneLoop();
+void fiveLoop();
+void tenLoop();
 
 void setup() {
-  serialPort.begin(19200); 
-  //start wifi subsystem
-  WiFi.begin(ssid, password);
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
-  //attempt to connect to the WIFI network and then connect to the MQTT server
-  reconnect();
-  //wait a bit before continuing
-  delay(2000);
+  Serial.begin(115200);
+  delay(10);
+  Serial.println("Booting");
+  initWIFI();
+  initOTA();
+  Serial.println("Ready");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
 
+  // Init loop timers
+  t.every(1000, tenLoop);
+  t.every(5000, fiveLoop);
+  t.every(10000, tenLoop);
+
+  //Set RX Enable and TX enable to output pins
   pinMode(RXen, OUTPUT);
   pinMode(TXen, OUTPUT);
-  pinMode(COM_VCC, OUTPUT);
   
+  //Set both pins active..?
   digitalWrite(RXen, LOW);
   digitalWrite(TXen, LOW);
-  digitalWrite(COM_VCC, LOW);
+
+  initMQTT();
+}
+
+void initMQTT() {
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+}
+
+void reconnectMQTT() {
+  // Loop until we're reconnected
+  Serial.println("Attempting MQTT connection...");
+  // Attempt to connect
+  if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+    Serial.println("connected");
+    mqttClient.setCallback(mqttDataCb);
+    mqttClient.subscribe(MQTT_COMMAND_CHANNEL);
+  } else {
+    Serial.print("failed, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+void initOTA() {
+  // Port defaults to 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  // ArduinoOTA.setHostname("myesp8266");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword("admin");
+
+  // Password can be set with it's md5 value as well
+  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH)
+      type = "sketch";
+    else // U_SPIFFS
+      type = "filesystem";
+
+    // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+    Serial.println("Start updating " + type);
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+}
+
+void initWIFI() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    Serial.println("Connection Failed! Rebooting...");
+    delay(5000);
+    ESP.restart();
+  }
 }
 
 void loop() {
-  //reconnect if connection is lost
-  if (!client.connected() && WiFi.status() == 3) {reconnect();}
+  ArduinoOTA.handle();
+  mqttClient.loop();
+  t.update();
+}
 
-  //maintain MQTT connection
-  client.loop();
-  
+void tenLoop() {
+  publishState();
+}
+
+void fiveLoop() {
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+}
+
+void oneLoop(){
   updateFlexitData();
-  updateMQTTServer();
-  //if received CS50 controller data is different than what has been sent to MQTT server, publish the data to the MQTT server
-  
-  
-  //MUST delay to allow ESP8266 WIFI functions to run
-  delay(10);
 }
 
-void updateMQTTServer() {
-  if (fanLevel != sentFanLevel)
-    if(client.publish(OutTopicFanLevel, fanLevel, 1))
+void mqttDataCb(char* topic, byte* data, unsigned int data_len) {
+  char svalue[MESSZ];
+  char topicBuf[TOPSZ];
+  char dataBuf[data_len+1];
+
+  strncpy(topicBuf, topic, sizeof(topicBuf));
+  memcpy(dataBuf, data, sizeof(dataBuf));
+  dataBuf[sizeof(dataBuf)-1] = 0;
+
+  snprintf_P(svalue, sizeof(svalue), PSTR("RSLT: Receive topic %s, data size %d, data %s"), topicBuf, data_len, dataBuf);
+  Serial.println(svalue);
+
+  // Extract command
+  memmove(topicBuf, topicBuf+sizeof(MQTT_COMMAND_CHANNEL)-2, sizeof(topicBuf)-sizeof(MQTT_COMMAND_CHANNEL));
+
+  int16_t payload = atoi(dataBuf);     // -32766 - 32767
+  Serial.print("Received payload: ");
+  Serial.println(payload);
+  if (!strcmp(topicBuf, "heater_enable")) {
+    if (payload==0)
+      createCommand(15,0);
+    else if (payload==1)
+      createCommand(15,128);
+    else
+      Serial.print("heater_enable payload unknown");
+  } else if (!strcmp(topicBuf, "fan_level")) {
+    if (payload>=0 && (char)payload<=3)
+      createCommand(11,payload);
+    else
+      Serial.print("fan_level payload unknown");
+  } else if (!strcmp(topicBuf, "temperature")) {
+    if (payload>=15 && (char)payload<=25)
+        createCommand(15,payload);
+    else
+      Serial.print("temperature payload unknown");
+  } else {
+      Serial.write("unknown topic");
+  }
+}
+
+void publishState() {
+  char message[10];
+
+  if (fanLevel != sentFanLevel) 
+  {
+    itoa(*fanLevel, message, 10);
+    if(mqttClient.publish(MQTT_STATUS_FAN, message))
       sentFanLevel = fanLevel;
+  }
   if (heatExchTemp != sentHeatExchTemp)
-    if(client.publish(OutTopicHeatExchTemp, heatExchTemp, 1))
-      sentHeatExchTemp = heatExchTemp;
-  if (preheatOnOff != sentPreheatOnOff)
-    if(client.publish(OutTopicPreheatOnOff, preheatOnOff, 1))
-      sentPreheatOnOff = preheatOnOff;
-  if (preheatActive != sentPreheatActive)
-    if(client.publish(OutTopicPreheatActive, preheatActive, 1))
-      sentPreheatActive = preheatActive;
-}
-
-void reconnect() {
-
-  //attempt to connect to the wifi if connection is lost
-  if(WiFi.status() != WL_CONNECTED)
-    //loop while we wait for connection
-    while (WiFi.status() != WL_CONNECTED) 
-      delay(500);
-
-  //make sure we are connected to WIFI before attemping to reconnect to MQTT
-  if(WiFi.status() == WL_CONNECTED)
-  // Loop until we're reconnected to the MQTT server
-    while (!client.connected())
-      // Generate client name based on MAC address and last 8 bits of microsecond counter
-      //if connected, subscribe to the topic(s) we want to be notified about
-      if (client.connect(ClientName)) {
-        client.subscribe(InTopicPreheatOnOff);
-        client.subscribe(InTopicFanLevel);
-        client.subscribe(InTopicHeatExchTemp);
-      }
+    {
+      itoa(*heatExchTemp, message, 10);
+      if(mqttClient.publish(MQTT_STATUS_TEMP, message))
+        sentHeatExchTemp = heatExchTemp;
+    }
+  if (preheatEnable != sentPreheatEnable) {
+    itoa(*preheatEnable, message, 10);
+    if(mqttClient.publish(MQTT_STATUS_HEATER_ENABLE, message))
+      sentPreheatEnable = preheatEnable;
+  }
+  if (preheatState != sentPreheatState) {
+    itoa(*preheatState, message, 10);
+    if(mqttClient.publish(MQTT_STATUS_HEATER_STATE, message))
+      sentPreheatState = preheatState;
+  }
 }
           
 /*/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -138,26 +276,25 @@ void reconnect() {
 * When combination is matched, read the line into buffer rawData[]
 *//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void updateFlexitData() {
-  digitalWrite(COM_VCC, HIGH); // activate MAX485 
   digitalWrite(RXen, LOW);     // RX enable
   uint8_t Buffer[1000];
   
   for (int i=0; i<1000; ++i) {
-    while (!serialPort.available()); 
-    Buffer[i] = serialPort.read();
+    while (!softSer.available()); 
+    Buffer[i] = softSer.read();
     if (Buffer[i]==22 && Buffer[i-2]==193 && Buffer[i-8]==195) {
       for (int i=0; i<25; ++i) {
-        while (!serialPort.available()); 
-        rawData[i] = serialPort.read();
+        while (!softSer.available()); 
+        rawData[i] = softSer.read();
       }
     break;
     }
-    //if (i == 999) serialPort.println("StBuffer not updated"); 
+    //if (i == 999) Serial1.println("StBuffer not updated"); 
   }
 
-  digitalWrite(RXen, HIGH);   // RX disable
-  digitalWrite(COM_VCC, LOW); // deactivate MAX485      
-  while (serialPort.available()) serialPort.read();     // empty serialPort RX buffer
+  digitalWrite(RXen, HIGH);   // RX disable   
+  while (softSer.available()) softSer.read();     // empty Serial1 RX buffer
+  publishState();
 }  
 
 /*/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////  
@@ -172,27 +309,25 @@ void processFlexitData(){
   }
       
   if (*rawPreheatOnOff == 128) {
-    *preheatOnOff = 1;
+    *preheatEnable = 1;
     commandBuffer[12] = 128;  
   }
   else if (*rawPreheatOnOff == 0) {
-    *preheatOnOff = commandBuffer[12] = *preheatActive = 0; 
+    *preheatEnable = commandBuffer[12] = *preheatState = 0; 
   }
       
   if (*rawHeatExchTemp >= 15 && *rawHeatExchTemp <= 25) {
     *heatExchTemp = commandBuffer[15] = *rawHeatExchTemp;  
   }
 
-  if (*rawPreheatActive1 > 10 && *preheatActive == 0 && *preheatOnOff == 1) { 
-    *preheatActive = 1;
+  if (*rawPreheatActive1 > 10 && *preheatState == 0 && *preheatEnable == 1) { 
+    *preheatState = 1;
   }
       
-  if (*rawPreheatActive2 < 100 && *preheatActive == 1 && *preheatOnOff == 1) {
-    *preheatActive = 0;
+  if (*rawPreheatActive2 < 100 && *preheatState == 1 && *preheatEnable == 1) {
+    *preheatState = 0;
   }
 }
-
-
 
 /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 * createCommand() takes two arguments, command and level
@@ -217,6 +352,7 @@ void processFlexitData(){
 ' Important! execute updateFlexitData() and processFlexitData() before each command.   
 *//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void createCommand(uint8_t cmd, uint8_t lvl) {                                    
+  Serial.println("Creating command");
   commandBuffer[cmd] = lvl;
   int sum1=0, sum2=0;
   for ( int i=5; i<((uint8_t)sizeof(commandBuffer)-2) ; ++i) {
@@ -225,38 +361,8 @@ void createCommand(uint8_t cmd, uint8_t lvl) {
   }
   commandBuffer[sizeof(commandBuffer)-2] = sum1%256;  
   commandBuffer[sizeof(commandBuffer)-1] = sum2%256;
-
+  
   sendCommand();
-}
-
-void callback(char* topic, byte* payload, unsigned int length) {
-  if(topic==InTopicPreheatOnOff)
-  {
-    if (payload[0]==0)
-      createCommand(15,0);
-    else if (payload[0]==1)
-      createCommand(15,128);
-    else
-      //should this be placed another place? Is callback paused while running callback?
-      client.print("heat_cmd_unknown");
-  }
-  else if(topic==InTopicFanLevel)
-  {
-    if (payload[0]>=0 && (char)payload[0]<=3)
-      createCommand(11,payload[0]);
-    else
-      client.print("fan_cmd_unknown");
-  }
-  else if(topic==InTopicHeatExchTemp)
-  {
-      if (payload[0]>=15 && (char)payload[0]<=25)
-        createCommand(15,payload[0]);
-      else
-        client.print("tmp_cmd_unknown");
-  } else {
-    //client.print("topic " + topic + " unknown");
-  }
-  //then back to loop, wait for command confirmation from updateFlexitData()
 }
 
 /*/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -264,40 +370,50 @@ void callback(char* topic, byte* payload, unsigned int length) {
 * Find the length of the incomming line (value number 8 in each line), count the bytes until end of line is reached, jump in and send command   
 */////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////  
 void sendCommand () {  
-  digitalWrite(COM_VCC, HIGH);      // activate MAX485
-  digitalWrite(RXen, LOW);      // RX enable
+  Serial.println("Sending command");
+  digitalWrite(RX, LOW);      // RX enable
   uint8_t data;  
   int Length, repeats=0;
   do {
-    while (!serialPort.available());
-    data=serialPort.read();
+    //pause until a command has been received
+    while (!softSer.available()){
+      Serial.println("Waiting for command from CS50");
+      delay(500);
+    }
+    data=softSer.read();
     if (data == 195){
-      while (!serialPort.available());
-      data=serialPort.read();
-      if (data == 1){
+      //pause until a command has been received
+      while (!softSer.available()){
+        Serial.println("Waiting for NEW command from CS50");
+        delay(500);
+      }
+      data=softSer.read();
+      if (data == 1) {
         for (int i=0; i<6; ++i) {
-          while (!serialPort.available());
-          serialPort.read();
+          while (!softSer.available());
+          softSer.read();
         }
     
-        while (!serialPort.available());    
-        Length = serialPort.read()+2;
+        while (!softSer.available()){
+          Serial.println("Waiting for another new command from CS50");
+          delay(500);
+        }
+        Length = softSer.read()+2;
         if (Length > 3 && Length < 33) {
           for (int i=0; i<Length; ++i) {
-            while (!serialPort.available());
-            serialPort.read();
+            while (!softSer.available());
+            softSer.read();
           }
-          digitalWrite(TXen, LOW);      // TX enable
+          digitalWrite(TX, LOW);      // TX enable
           delay(10);
-          serialPort.write(commandBuffer, 18);     // transmit command
-          serialPort.flush();
-          digitalWrite(TXen, HIGH);     // TX disable
-          serialPort.println("command sent");
+          softSer.write(commandBuffer, 18);     // transmit command
+          softSer.flush();
+          digitalWrite(TX, HIGH);     // TX disable
+          softSer.println("command sent");
           ++repeats;
         }
       }
     }   
   } while (repeats<5);
-  digitalWrite(RXen, HIGH);     // RX disable
-  digitalWrite(COM_VCC, LOW);     // deactivate MAX485  
+  digitalWrite(RX, HIGH);     // RX disable
 }
